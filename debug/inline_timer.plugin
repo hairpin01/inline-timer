@@ -15,7 +15,7 @@ from android.util import StateSet
 from android.view import MotionEvent
 from android_utils import log, run_on_ui_thread
 from base_plugin import BasePlugin, HookResult, MethodHook
-from hook_utils import find_class, get_private_field
+from hook_utils import find_class, get_private_field, set_private_field
 from ui.settings import Divider, Header, Input, Selector, Switch, Text
 
 
@@ -39,7 +39,7 @@ NEW_MESSAGE_UPDATES = {"TL_updateNewMessage", "TL_updateNewChannelMessage"}
 REGISTERED_HOOKS = tuple(sorted(EDIT_UPDATES | NEW_MESSAGE_UPDATES | {CALLBACK_REQUEST}))
 HELPER_CLASS_NAME = "org.exteragram.plugins.inlinetimer.InlineTimerHelper"
 HELPER_DEX_URL = "https://raw.githubusercontent.com/hairpin01/inline-timer/main/debug/inline_timer_helper/inline_timer_helper.dex"
-HELPER_DEX_SHA256 = "542c40e3b2b8ce3d24d809bfd82c0767fe01874619257bf5b2a235936b0be574"
+HELPER_DEX_SHA256 = "eafe1fa86d83e2746318e65b8544d6c23acd6969879c1ec565c9616c5186dc11"
 HELPER_DEX_FILE = "inline_timer_helper.dex"
 
 
@@ -80,16 +80,44 @@ class _ProcessUpdatesHook(_PluginHook):
 
 class _SendCallbackHook(_PluginHook):
     def before_hooked_method(self, param: Any) -> None:
-        self.plugin.reset_from_callback_args(_param_args(param), "sendCallback:before")
+        self.plugin.reset_from_callback_args(_param_args(param), "sendCallback:before", mark_button=True)
 
     def after_hooked_method(self, param: Any) -> None:
-        self.plugin.reset_from_callback_args(_param_args(param), "sendCallback:after")
+        self.plugin.reset_from_callback_args(_param_args(param), "sendCallback:after", mark_button=True)
+
+
+class _BotButtonSetPressedHook(_PluginHook):
+    def before_hooked_method(self, param: Any) -> None:
+        if not self.plugin._setting_bool("disable_ripple", True):
+            return
+        try:
+            args = _param_args(param)
+            if len(args) > 0:
+                args[0] = False
+        except Exception:
+            pass
+
+    def after_hooked_method(self, param: Any) -> None:
+        if self.plugin._setting_bool("disable_ripple", True):
+            self.plugin.clear_bot_button_visuals(param.thisObject)
+
+
+class _BotButtonPressScaleHook(_PluginHook):
+    def after_hooked_method(self, param: Any) -> None:
+        if not self.plugin._setting_bool("disable_ripple", True):
+            return
+        self.plugin.clear_bot_button_visuals(param.thisObject)
+        try:
+            param.setResult(1.0)
+        except Exception:
+            pass
 
 
 class InlineTimerPlugin(BasePlugin):
     def __init__(self):
         super().__init__()
         self.timer_map: Dict[TimerKey, int] = {}
+        self.active_button_map: Dict[TimerKey, str] = {}
         self._pending_callbacks: Dict[int, List[TimerKey]] = {}
         self._visible_cells: List[Any] = []
         self._unhooks: List[Any] = []
@@ -127,6 +155,7 @@ class InlineTimerPlugin(BasePlugin):
         self._running = False
         self._tick_token += 1
         self.timer_map.clear()
+        self.active_button_map.clear()
         self._pending_callbacks.clear()
         self._visible_cells.clear()
         self._unhook_all()
@@ -274,6 +303,11 @@ class InlineTimerPlugin(BasePlugin):
         send_messages_helper_cls = find_class("org.telegram.messenger.SendMessagesHelper")
         if send_messages_helper_cls is not None:
             self._hook_all(send_messages_helper_cls, "sendCallback", _SendCallbackHook(self))
+
+        bot_button_cls = find_class("org.telegram.ui.Cells.BotButton")
+        if bot_button_cls is not None:
+            self._hook_all(bot_button_cls, "setPressed", _BotButtonSetPressedHook(self))
+            self._hook_all(bot_button_cls, "getPressScale", _BotButtonPressScaleHook(self))
 
     # ------------------------------------------------------------------
     # Optional Java/Dex helper
@@ -642,16 +676,61 @@ class InlineTimerPlugin(BasePlugin):
         if key is not None:
             self.reset_timer(key, reason)
 
-    def reset_from_callback_args(self, args: Iterable[Any], reason: str) -> None:
+    def reset_from_callback_args(self, args: Iterable[Any], reason: str, mark_button: bool = False) -> None:
+        message_key = None
+        button_signature = ""
         for arg in args:
             key = self.key_from_message(arg)
             if key is not None:
-                self.reset_timer(key, reason)
-                return
+                message_key = key
+            sig = self.button_signature_from_any(arg)
+            if sig:
+                button_signature = sig
             key = self.key_from_callback_request(arg)
             if key is not None:
-                self.reset_timer(key, reason)
-                return
+                message_key = key
+
+        if message_key is None:
+            return
+        if mark_button and button_signature:
+            self.active_button_map[message_key] = button_signature
+            self._debug(f"active button ({reason}): {button_signature[:80]}")
+        self.reset_timer(message_key, reason)
+
+    def button_signature_from_any(self, value: Any) -> str:
+        if value is None:
+            return ""
+        for field_name in ("button", "buttonCustom", "buttonImpl"):
+            nested = self._field(value, field_name)
+            sig = self.button_signature_from_keyboard_button(nested)
+            if sig:
+                return sig
+        return self.button_signature_from_keyboard_button(value)
+
+    def button_signature_from_keyboard_button(self, button: Any) -> str:
+        if button is None:
+            return ""
+        cls = self._simple_name(button)
+        parts = [cls]
+        for name in ("text", "data", "url", "query", "same_peer", "requires_password", "button_id"):
+            value = self._field(button, name)
+            if value is not None:
+                parts.append(f"{name}={self._signature_value(value)}")
+        if len(parts) == 1:
+            value = self._field(button, "title") or self._invoke_no_args(button, "toString")
+            if value is not None:
+                parts.append(f"value={self._signature_value(value)}")
+        return "|".join(parts) if len(parts) > 1 else ""
+
+    def _signature_value(self, value: Any) -> str:
+        try:
+            if not isinstance(value, str):
+                data = bytes(value)
+                if data:
+                    return data.hex()
+        except Exception:
+            pass
+        return str(value)
 
     def key_from_callback_request(self, request: Any) -> Optional[TimerKey]:
         if request is None:
@@ -749,14 +828,21 @@ class InlineTimerPlugin(BasePlugin):
                 self._log_once("missing_key", "could not resolve dialog_id/msg_id for ChatMessageCell")
                 return
 
+            active_signature = self.active_button_map.get(key)
+            if not active_signature:
+                return
+
+            start_ms = self.timer_map.get(key)
+            if start_ms is None:
+                return
+
             self._remember_cell(cell)
-            start_ms = self.ensure_timer(key)
             elapsed = max(0, now - start_ms)
             text = self.format_elapsed(elapsed)
             color = self.timer_color()
             position_left = self._position_left()
 
-            helper_result = self._helper_call("drawTimers", cell, canvas, text, self._java_long(color), self._java_bool(position_left))
+            helper_result = self._helper_call("drawTimers", cell, canvas, text, self._java_long(color), self._java_bool(position_left), active_signature)
             if self._is_java_true(helper_result):
                 return
 
@@ -771,6 +857,8 @@ class InlineTimerPlugin(BasePlugin):
 
             for button in self._iter_java_list(bot_buttons):
                 if self._setting_bool_field(button, "isSeparator", False):
+                    continue
+                if self.button_signature_from_any(button) != active_signature:
                     continue
                 x = self._to_float(self._field(button, "x"), 0.0) * width_for_buttons + add_x
                 y = self._to_float(self._field(button, "y"), 0.0) + base_y
@@ -909,6 +997,24 @@ class InlineTimerPlugin(BasePlugin):
                 self._safe_call(lambda: cell.invalidate(), "cell.invalidate")
         except Exception:
             self._log_once("clear_ripple_failed", f"clear ripple failed: {traceback.format_exc()}")
+
+    def clear_bot_button_visuals(self, button: Any) -> None:
+        if button is None:
+            return
+        try:
+            selector = self._field(button, "selectorDrawable")
+            if selector is not None:
+                self._safe_call(lambda s=selector: s.setState(StateSet.NOTHING), "botButton.selector.setState")
+
+            animator = self._field(button, "pressAnimator")
+            if animator is not None:
+                self._safe_call(lambda a=animator: a.cancel(), "botButton.animator.cancel")
+
+            set_private_field(button, "pressAnimator", None)
+            set_private_field(button, "pressed", False)
+            set_private_field(button, "pressT", 0.0)
+        except Exception:
+            self._log_once("clear_bot_button_failed", f"clear bot button failed: {traceback.format_exc()}")
 
     # ------------------------------------------------------------------
     # Reflection helpers

@@ -33,7 +33,7 @@ public final class InlineTimerHelper {
     private InlineTimerHelper() {
     }
 
-    public static boolean drawTimers(Object cell, Canvas canvas, String text, long color, boolean left) {
+    public static boolean drawTimers(Object cell, Canvas canvas, String text, long color, boolean left, String activeSignature) {
         if (cell == null || canvas == null || text == null) {
             return false;
         }
@@ -66,6 +66,9 @@ public final class InlineTimerHelper {
 
             for (Object button : buttons) {
                 if (button == null || boolValue(field(button, "isSeparator"))) {
+                    continue;
+                }
+                if (activeSignature != null && activeSignature.length() > 0 && !activeSignature.equals(buttonSignature(button))) {
                     continue;
                 }
 
@@ -227,6 +230,65 @@ public final class InlineTimerHelper {
 
         METHODS.put(key, null);
         return null;
+    }
+
+    private static String buttonSignature(Object value) throws Exception {
+        if (value == null) {
+            return "";
+        }
+
+        String sig = keyboardButtonSignature(field(value, "button"));
+        if (!sig.isEmpty()) {
+            return sig;
+        }
+        sig = keyboardButtonSignature(field(value, "buttonCustom"));
+        if (!sig.isEmpty()) {
+            return sig;
+        }
+        sig = keyboardButtonSignature(field(value, "buttonImpl"));
+        if (!sig.isEmpty()) {
+            return sig;
+        }
+        return keyboardButtonSignature(value);
+    }
+
+    private static String keyboardButtonSignature(Object button) throws Exception {
+        if (button == null) {
+            return "";
+        }
+
+        StringBuilder builder = new StringBuilder(button.getClass().getSimpleName());
+        appendField(builder, button, "text");
+        appendField(builder, button, "data");
+        appendField(builder, button, "url");
+        appendField(builder, button, "query");
+        appendField(builder, button, "same_peer");
+        appendField(builder, button, "requires_password");
+        appendField(builder, button, "button_id");
+        return builder.indexOf("|") >= 0 ? builder.toString() : "";
+    }
+
+    private static void appendField(StringBuilder builder, Object target, String name) throws Exception {
+        Object value = field(target, name);
+        if (value != null) {
+            builder.append("|").append(name).append("=").append(signatureValue(value));
+        }
+    }
+
+    private static String signatureValue(Object value) {
+        if (value instanceof byte[]) {
+            byte[] data = (byte[]) value;
+            StringBuilder hex = new StringBuilder(data.length * 2);
+            for (byte item : data) {
+                int b = item & 0xff;
+                if (b < 16) {
+                    hex.append('0');
+                }
+                hex.append(Integer.toHexString(b));
+            }
+            return hex.toString();
+        }
+        return String.valueOf(value);
     }
 
     private static int intValue(Object value) {
