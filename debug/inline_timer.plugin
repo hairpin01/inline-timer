@@ -184,6 +184,13 @@ class InlineTimerPlugin(BasePlugin):
                 icon="msg_log",
             ),
             Text(
+                text="View logs",
+                subtext="Open the latest Inline Timer logs here in settings.",
+                icon="msg_view_file",
+                accent=True,
+                on_click=lambda view: self.show_logs_in_settings(),
+            ),
+            Text(
                 text="Send logs file to chat",
                 subtext="Sends inline_timer_logs.txt to Log chat id.",
                 icon="msg2_discuss",
@@ -1058,6 +1065,9 @@ class InlineTimerPlugin(BasePlugin):
 
     def _position_left(self) -> bool:
         return self._to_int(self.get_setting("position", 1), 1) == 0
+
+    def show_logs_in_settings(self) -> None:
+        self._show_dialog("Inline Timer logs", self.build_logs_text())
 
     def send_logs_to_configured_chat(self) -> None:
         peer_raw = str(self.get_setting("log_peer_id", "") or "").strip()
