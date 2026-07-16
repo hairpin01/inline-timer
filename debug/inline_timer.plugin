@@ -102,6 +102,7 @@ class InlineTimerPlugin(BasePlugin):
         self._helper_last_status = "not loaded"
         self._helper_last_error = ""
         self._helper_last_path = ""
+        self._context_fallback: Optional[Any] = None
         self._log_lines = deque(maxlen=200)
         self._last_logged_missing_fields: set[str] = set()
 
@@ -173,7 +174,7 @@ class InlineTimerPlugin(BasePlugin):
                 subtext="The plugin downloads it automatically on load. Tap here to retry manually if it did not start.",
                 icon="msg_download",
                 accent=True,
-                on_click=lambda view: self.download_helper_dex_manually(),
+                on_click=lambda view: self.download_helper_dex_manually(view),
             ),
             Input(
                 key="log_peer_id",
@@ -262,9 +263,21 @@ class InlineTimerPlugin(BasePlugin):
     # Optional Java/Dex helper
     # ------------------------------------------------------------------
 
-    def download_helper_dex_manually(self) -> None:
+    def download_helper_dex_manually(self, view: Any = None) -> None:
+        self._remember_context_from_view(view)
         self._show_bulletin("Downloading helper dex...")
         self._ensure_helper_dex_async(force_download=True, notify=True)
+
+    def _remember_context_from_view(self, view: Any) -> None:
+        if view is None:
+            return
+        try:
+            context = view.getContext()
+            app_context = context.getApplicationContext() if context is not None else None
+            self._context_fallback = app_context or context
+            self._log("captured helper context from settings view")
+        except Exception:
+            self._log_once("view_context_failed", f"view context lookup failed: {traceback.format_exc()}")
 
     def _ensure_helper_dex_async(self, force_download: bool, notify: bool = False) -> None:
         if self._helper_download_running:
@@ -434,15 +447,40 @@ class InlineTimerPlugin(BasePlugin):
         return digest.hexdigest()
 
     def _application_context(self) -> Any:
+        if self._context_fallback is not None:
+            return self._context_fallback
+
         clazz = find_class("org.telegram.messenger.ApplicationLoader")
-        if clazz is None:
-            return None
+        if clazz is not None:
+            for field_name in ("applicationContext", "applicationLoaderInstance"):
+                try:
+                    field = clazz.getDeclaredField(field_name)
+                    field.setAccessible(True)
+                    value = field.get(None)
+                    if value is None:
+                        continue
+                    if field_name == "applicationLoaderInstance":
+                        app_context = value.getApplicationContext()
+                        if app_context is not None:
+                            self._context_fallback = app_context
+                            return app_context
+                    self._context_fallback = value
+                    return value
+                except Exception:
+                    continue
+
         try:
-            field = clazz.getDeclaredField("applicationContext")
-            field.setAccessible(True)
-            return field.get(None)
+            from client_utils import get_last_fragment
+
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment is not None else None
+            if activity is not None:
+                app_context = activity.getApplicationContext()
+                self._context_fallback = app_context or activity
+                return self._context_fallback
         except Exception:
-            return None
+            self._log_once("fragment_context_failed", f"fragment context lookup failed: {traceback.format_exc()}")
+        return None
 
     def _helper_call(self, method_name: str, *args: Any) -> Any:
         if self._helper_failed:
