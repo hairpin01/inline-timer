@@ -15,7 +15,7 @@ from android.util import StateSet
 from android.view import MotionEvent
 from android_utils import log, run_on_ui_thread
 from base_plugin import BasePlugin, HookResult, MethodHook
-from hook_utils import find_class, get_private_field, set_private_field
+from hook_utils import find_class, get_private_field
 from ui.settings import Divider, Header, Input, Selector, Switch, Text
 
 
@@ -84,33 +84,6 @@ class _SendCallbackHook(_PluginHook):
 
     def after_hooked_method(self, param: Any) -> None:
         self.plugin.reset_from_callback_args(_param_args(param), "sendCallback:after", mark_button=True)
-
-
-class _BotButtonSetPressedHook(_PluginHook):
-    def before_hooked_method(self, param: Any) -> None:
-        if not self.plugin._setting_bool("disable_ripple", True):
-            return
-        try:
-            args = _param_args(param)
-            if len(args) > 0:
-                args[0] = False
-        except Exception:
-            pass
-
-    def after_hooked_method(self, param: Any) -> None:
-        if self.plugin._setting_bool("disable_ripple", True):
-            self.plugin.clear_bot_button_visuals(param.thisObject)
-
-
-class _BotButtonPressScaleHook(_PluginHook):
-    def after_hooked_method(self, param: Any) -> None:
-        if not self.plugin._setting_bool("disable_ripple", True):
-            return
-        self.plugin.clear_bot_button_visuals(param.thisObject)
-        try:
-            param.setResult(1.0)
-        except Exception:
-            pass
 
 
 class InlineTimerPlugin(BasePlugin):
@@ -303,11 +276,6 @@ class InlineTimerPlugin(BasePlugin):
         send_messages_helper_cls = find_class("org.telegram.messenger.SendMessagesHelper")
         if send_messages_helper_cls is not None:
             self._hook_all(send_messages_helper_cls, "sendCallback", _SendCallbackHook(self))
-
-        bot_button_cls = find_class("org.telegram.ui.Cells.BotButton")
-        if bot_button_cls is not None:
-            self._hook_all(bot_button_cls, "setPressed", _BotButtonSetPressedHook(self))
-            self._hook_all(bot_button_cls, "getPressScale", _BotButtonPressScaleHook(self))
 
     # ------------------------------------------------------------------
     # Optional Java/Dex helper
@@ -997,24 +965,6 @@ class InlineTimerPlugin(BasePlugin):
                 self._safe_call(lambda: cell.invalidate(), "cell.invalidate")
         except Exception:
             self._log_once("clear_ripple_failed", f"clear ripple failed: {traceback.format_exc()}")
-
-    def clear_bot_button_visuals(self, button: Any) -> None:
-        if button is None:
-            return
-        try:
-            selector = self._field(button, "selectorDrawable")
-            if selector is not None:
-                self._safe_call(lambda s=selector: s.setState(StateSet.NOTHING), "botButton.selector.setState")
-
-            animator = self._field(button, "pressAnimator")
-            if animator is not None:
-                self._safe_call(lambda a=animator: a.cancel(), "botButton.animator.cancel")
-
-            set_private_field(button, "pressAnimator", None)
-            set_private_field(button, "pressed", False)
-            set_private_field(button, "pressT", 0.0)
-        except Exception:
-            self._log_once("clear_bot_button_failed", f"clear bot button failed: {traceback.format_exc()}")
 
     # ------------------------------------------------------------------
     # Reflection helpers
