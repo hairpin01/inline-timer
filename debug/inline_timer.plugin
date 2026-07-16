@@ -1,0 +1,907 @@
+from __future__ import annotations
+
+import hashlib
+import os
+import traceback
+import urllib.request
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from android.graphics import Color, Paint, Typeface
+from android.os import SystemClock
+from android.util import StateSet
+from android.view import MotionEvent
+from dalvik.system import DexClassLoader
+from android_utils import log, run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, MethodHook
+from hook_utils import find_class, get_private_field
+from ui.settings import Divider, Header, Input, Selector, Switch, Text
+
+
+__id__ = "inline_timer"
+__name__ = "Inline Timer"
+__description__ = "Shows a live timer on inline bot buttons and removes the press ripple."
+__author__ = "@local"
+__version__ = "0.1.0"
+__icon__ = "exteraPlugins/1"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.3"
+
+
+TimerKey = Tuple[int, int]
+
+
+CALLBACK_REQUEST = "TL_messages_getBotCallbackAnswer"
+EDIT_UPDATES = {"TL_updateEditMessage", "TL_updateEditChannelMessage"}
+NEW_MESSAGE_UPDATES = {"TL_updateNewMessage", "TL_updateNewChannelMessage"}
+REGISTERED_HOOKS = tuple(sorted(EDIT_UPDATES | NEW_MESSAGE_UPDATES | {CALLBACK_REQUEST}))
+HELPER_CLASS_NAME = "org.exteragram.plugins.inlinetimer.InlineTimerHelper"
+
+
+def _param_args(param: Any) -> Iterable[Any]:
+    args = getattr(param, "args", None)
+    return args if args is not None else []
+
+
+def _param_arg(param: Any, index: int = 0) -> Any:
+    try:
+        return _param_args(param)[index]
+    except Exception:
+        return None
+
+
+class _PluginHook(MethodHook):
+    def __init__(self, plugin: "InlineTimerPlugin"):
+        self.plugin = plugin
+
+
+class _DrawHook(_PluginHook):
+    def after_hooked_method(self, param: Any) -> None:
+        canvas = _param_arg(param)
+        self.plugin.draw_timers(param.thisObject, canvas)
+
+
+class _TouchHook(_PluginHook):
+    def after_hooked_method(self, param: Any) -> None:
+        event = _param_arg(param)
+        self.plugin.clear_button_press_visuals(param.thisObject, event)
+
+
+class _ProcessUpdatesHook(_PluginHook):
+    def after_hooked_method(self, param: Any) -> None:
+        for arg in _param_args(param):
+            self.plugin.scan_update_container(arg)
+
+
+class _SendCallbackHook(_PluginHook):
+    def before_hooked_method(self, param: Any) -> None:
+        self.plugin.reset_from_callback_args(_param_args(param), "sendCallback:before")
+
+    def after_hooked_method(self, param: Any) -> None:
+        self.plugin.reset_from_callback_args(_param_args(param), "sendCallback:after")
+
+
+class InlineTimerPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.timer_map: Dict[TimerKey, int] = {}
+        self._pending_callbacks: Dict[int, List[TimerKey]] = {}
+        self._visible_cells: List[Any] = []
+        self._unhooks: List[Any] = []
+        self._running = False
+        self._tick_token = 0
+        self._paint: Optional[Paint] = None
+        self._helper_class: Optional[Any] = None
+        self._helper_failed = False
+        self._last_logged_missing_fields: set[str] = set()
+
+    # ------------------------------------------------------------------
+    # Lifecycle / settings
+    # ------------------------------------------------------------------
+
+    def on_plugin_load(self) -> None:
+        self._running = True
+        self._tick_token += 1
+
+        for hook_name in REGISTERED_HOOKS:
+            self._safe_call(lambda name=hook_name: self.add_hook(name), f"add_hook({hook_name})")
+
+        self._load_helper_dex()
+        self._install_xposed_hooks()
+        self._schedule_tick(0)
+        self._log("loaded")
+
+    def on_plugin_unload(self) -> None:
+        self._running = False
+        self._tick_token += 1
+        self.timer_map.clear()
+        self._pending_callbacks.clear()
+        self._visible_cells.clear()
+        self._unhook_all()
+        self._log("unloaded")
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Inline Timer"),
+            Switch(
+                key="enabled",
+                text="Show timers",
+                default=True,
+                subtext="Draw elapsed time on inline buttons attached to messages.",
+                icon="msg_recent",
+            ),
+            Switch(
+                key="disable_ripple",
+                text="Disable button ripple",
+                default=True,
+                subtext="Keep clicks working, but clear the pressed/ripple visual state.",
+                icon="msg_clear",
+            ),
+            Selector(
+                key="position",
+                text="Timer position",
+                default=1,
+                items=["Left", "Right"],
+                icon="msg_list",
+            ),
+            Input(
+                key="tick_ms",
+                text="Refresh interval, ms",
+                default="100",
+                subtext="Lower values are smoother; 100 ms is usually enough.",
+                icon="msg_retry",
+            ),
+            Input(
+                key="timer_color",
+                text="Timer color",
+                default="#B0FFFFFF",
+                subtext="Android color string, for example #B0FFFFFF or #AA000000.",
+                icon="msg_palette",
+            ),
+            Input(
+                key="helper_dex_path",
+                text="Helper dex path",
+                default="",
+                subtext="Optional local path to inline_timer_helper.dex. If empty, Python reflection fallback is used.",
+                icon="msg_file",
+            ),
+            Input(
+                key="helper_dex_url",
+                text="Helper dex URL",
+                default="",
+                subtext="Optional direct URL, for example raw.githubusercontent.com/.../inline_timer_helper.dex.",
+                icon="msg_link",
+            ),
+            Input(
+                key="helper_dex_sha256",
+                text="Helper dex SHA-256",
+                default="",
+                subtext="Recommended for URL loading. Leave empty only while testing your own dex.",
+                icon="msg_permissions",
+            ),
+            Switch(
+                key="debug_logs",
+                text="Debug logs",
+                default=False,
+                subtext="Log hook installs and timer resets. Keep disabled for normal use.",
+                icon="msg_info",
+            ),
+            Divider(),
+            Text(
+                text="Notes",
+                subtext="The plugin uses Telegram internal fields, so app updates can require field-name adjustments.",
+                icon="msg_info",
+            ),
+        ]
+
+    # ------------------------------------------------------------------
+    # High-level plugin hooks
+    # ------------------------------------------------------------------
+
+    def on_update_hook(self, update_name: str, account: int, update: Any) -> HookResult:
+        self.handle_update(update, update_name)
+        return HookResult()
+
+    def on_updates_hook(self, container_name: str, account: int, updates: Any) -> HookResult:
+        self.scan_update_container(updates)
+        return HookResult()
+
+    def pre_request_hook(self, request_name: str, account: int, request: Any) -> HookResult:
+        if request_name == CALLBACK_REQUEST:
+            key = self.key_from_callback_request(request)
+            if key is not None:
+                pending = self._pending_callbacks.setdefault(int(account), [])
+                pending.append(key)
+                if len(pending) > 32:
+                    del pending[:-32]
+                self.reset_timer(key, "callback:request")
+        return HookResult()
+
+    def post_request_hook(self, request_name: str, account: int, response: Any, error: Any) -> HookResult:
+        if request_name == CALLBACK_REQUEST:
+            # The SDK post hook does not pass the completed request object, so
+            # pairing by FIFO can reset the wrong message when callbacks finish
+            # out of order. Reset every unresolved callback for this account
+            # instead of pretending we know which request produced the answer.
+            pending = self._pending_callbacks.pop(int(account), [])
+            for key in pending:
+                self.reset_timer(key, "callback:answer")
+        return HookResult()
+
+    # ------------------------------------------------------------------
+    # Xposed registration
+    # ------------------------------------------------------------------
+
+    def _install_xposed_hooks(self) -> None:
+        chat_cell_cls = find_class("org.telegram.ui.Cells.ChatMessageCell")
+        if chat_cell_cls is not None:
+            self._hook_all(chat_cell_cls, "draw", _DrawHook(self))
+            self._hook_all(chat_cell_cls, "onTouchEvent", _TouchHook(self))
+        else:
+            self._log("ChatMessageCell class not found")
+
+        messages_controller_cls = find_class("org.telegram.messenger.MessagesController")
+        if messages_controller_cls is not None:
+            self._hook_all(messages_controller_cls, "processUpdates", _ProcessUpdatesHook(self))
+
+        send_messages_helper_cls = find_class("org.telegram.messenger.SendMessagesHelper")
+        if send_messages_helper_cls is not None:
+            self._hook_all(send_messages_helper_cls, "sendCallback", _SendCallbackHook(self))
+
+    # ------------------------------------------------------------------
+    # Optional Java/Dex helper
+    # ------------------------------------------------------------------
+
+    def _load_helper_dex(self) -> None:
+        self._helper_class = None
+        self._helper_failed = False
+
+        dex_path = str(self.get_setting("helper_dex_path", "") or "").strip()
+        dex_url = str(self.get_setting("helper_dex_url", "") or "").strip()
+        expected_hash = str(self.get_setting("helper_dex_sha256", "") or "").strip().lower()
+
+        try:
+            context = self._application_context()
+            if context is None:
+                return
+            work_dir = context.getDir("inline_timer_helper", 0)
+            optimized_dir = context.getDir("inline_timer_helper_odex", 0)
+
+            if not dex_path and dex_url:
+                dex_path = os.path.join(str(work_dir.getAbsolutePath()), "inline_timer_helper.dex")
+                self._download_helper_dex(dex_url, dex_path)
+
+            if not dex_path or not os.path.exists(dex_path):
+                return
+
+            actual_hash = self._sha256_file(dex_path)
+            if expected_hash and actual_hash != expected_hash:
+                self._helper_failed = True
+                self._log(f"helper dex hash mismatch: {actual_hash}")
+                return
+
+            parent_loader = context.getClassLoader()
+            loader = DexClassLoader(
+                dex_path,
+                str(optimized_dir.getAbsolutePath()),
+                None,
+                parent_loader,
+            )
+            self._helper_class = loader.loadClass(HELPER_CLASS_NAME)
+            self._log(f"helper dex loaded: {HELPER_CLASS_NAME}")
+        except Exception:
+            self._helper_failed = True
+            self._log_once("helper_load_failed", f"helper dex load failed: {traceback.format_exc()}")
+
+    def _download_helper_dex(self, url: str, target_path: str) -> None:
+        tmp_path = f"{target_path}.tmp"
+        with urllib.request.urlopen(url, timeout=15) as response:
+            data = response.read(1024 * 1024 * 2)
+        with open(tmp_path, "wb") as file:
+            file.write(data)
+        os.replace(tmp_path, target_path)
+
+    def _sha256_file(self, path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as file:
+            for chunk in iter(lambda: file.read(1024 * 64), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _application_context(self) -> Any:
+        clazz = find_class("org.telegram.messenger.ApplicationLoader")
+        if clazz is None:
+            return None
+        try:
+            field = clazz.getDeclaredField("applicationContext")
+            field.setAccessible(True)
+            return field.get(None)
+        except Exception:
+            return None
+
+    def _helper_call(self, method_name: str, *args: Any) -> Any:
+        if self._helper_failed:
+            return None
+        helper = self._helper_class
+        if helper is None:
+            return None
+        try:
+            methods = helper.getDeclaredMethods()
+            for method in self._iter_java_list(methods):
+                if str(method.getName()) != method_name:
+                    continue
+                if self._java_list_size(method.getParameterTypes()) != len(args):
+                    continue
+                method.setAccessible(True)
+                return method.invoke(None, list(args))
+        except Exception:
+            self._helper_failed = True
+            self._log_once(f"helper_{method_name}_failed", f"helper {method_name} failed: {traceback.format_exc()}")
+        return None
+
+    def _hook_all(self, clazz: Any, method_name: str, hook: MethodHook) -> None:
+        try:
+            result = self.hook_all_methods(clazz, method_name, hook)
+            if result is None:
+                return
+            if isinstance(result, list):
+                self._unhooks.extend(result)
+                count = len(result)
+            else:
+                self._unhooks.append(result)
+                count = 1
+            self._log(f"hooked {self._class_name(clazz)}.{method_name} ({count})")
+        except Exception:
+            self._log(f"failed to hook {self._class_name(clazz)}.{method_name}: {traceback.format_exc()}")
+
+    def _unhook_all(self) -> None:
+        for unhook in self._unhooks:
+            try:
+                if hasattr(unhook, "unhook"):
+                    unhook.unhook()
+                elif hasattr(unhook, "remove"):
+                    unhook.remove()
+            except Exception:
+                self._log(f"unhook failed: {traceback.format_exc()}")
+        self._unhooks.clear()
+
+    # ------------------------------------------------------------------
+    # Timer state
+    # ------------------------------------------------------------------
+
+    def reset_timer(self, key: TimerKey, reason: str) -> None:
+        if key[0] == 0 or key[1] == 0:
+            return
+        self.timer_map[key] = self.now_ms()
+        self._trim_timers()
+        self._debug(f"reset timer ({reason})")
+
+    def ensure_timer(self, key: TimerKey) -> int:
+        value = self.timer_map.get(key)
+        if value is None:
+            value = self.now_ms()
+            self.timer_map[key] = value
+            self._trim_timers()
+        return value
+
+    def now_ms(self) -> int:
+        return int(SystemClock.elapsedRealtime())
+
+    def _trim_timers(self, max_size: int = 1000) -> None:
+        extra = len(self.timer_map) - max_size
+        if extra <= 0:
+            return
+        for key in list(self.timer_map.keys())[:extra]:
+            self.timer_map.pop(key, None)
+
+    # ------------------------------------------------------------------
+    # Update / callback extraction
+    # ------------------------------------------------------------------
+
+    def handle_update(self, update: Any, update_name: Optional[str] = None) -> None:
+        name = update_name or self._simple_name(update)
+        if name in EDIT_UPDATES or name.endswith("updateEditMessage") or name.endswith("updateEditChannelMessage"):
+            message = self._field(update, "message")
+            self.reset_from_message(message, f"update:{name}")
+            return
+
+        if name in NEW_MESSAGE_UPDATES or name.endswith("updateNewMessage") or name.endswith("updateNewChannelMessage"):
+            message = self._field(update, "message")
+            self.reset_new_message_if_inline(message, f"update:{name}")
+            return
+
+        if "BotCallback" in name or "CallbackQuery" in name:
+            key = self.key_from_callback_request(update)
+            if key is not None:
+                self.reset_timer(key, f"update:{name}")
+
+    def scan_update_container(self, value: Any, depth: int = 0) -> None:
+        if value is None or depth > 4:
+            return
+
+        if self._is_java_list(value):
+            for item in self._iter_java_list(value):
+                self.scan_update_container(item, depth + 1)
+            return
+
+        name = self._simple_name(value)
+        if name.startswith("TL_update") or "Update" in name:
+            self.handle_update(value, name)
+
+        for field_name in ("updates", "update", "message", "messages"):
+            nested = self._field(value, field_name)
+            if nested is not None and nested is not value:
+                self.scan_update_container(nested, depth + 1)
+
+    def reset_new_message_if_inline(self, value: Any, reason: str) -> None:
+        if value is None:
+            return
+        if self._is_java_list(value):
+            for item in self._iter_java_list(value):
+                self.reset_new_message_if_inline(item, reason)
+            return
+
+        message = self._message_owner(value)
+        if message is not None and self.message_has_inline_markup(message):
+            self.reset_from_message(message, reason)
+
+    def reset_from_message(self, message_or_object: Any, reason: str) -> None:
+        key = self.key_from_message(message_or_object)
+        if key is not None:
+            self.reset_timer(key, reason)
+
+    def reset_from_callback_args(self, args: Iterable[Any], reason: str) -> None:
+        for arg in args:
+            key = self.key_from_message(arg)
+            if key is not None:
+                self.reset_timer(key, reason)
+                return
+            key = self.key_from_callback_request(arg)
+            if key is not None:
+                self.reset_timer(key, reason)
+                return
+
+    def key_from_callback_request(self, request: Any) -> Optional[TimerKey]:
+        if request is None:
+            return None
+
+        msg_id = self._to_int(self._field(request, "msg_id"), 0)
+        if msg_id == 0:
+            msg_id = self._to_int(self._field(request, "message_id"), 0)
+
+        dialog_id = self.dialog_id_from_peer(self._field(request, "peer"))
+        if dialog_id is None:
+            dialog_id = self.dialog_id_from_peer(self._field(request, "chat_instance"))
+
+        if dialog_id is None or msg_id == 0:
+            return None
+        return (dialog_id, msg_id)
+
+    def key_from_message(self, message_or_object: Any) -> Optional[TimerKey]:
+        if message_or_object is None:
+            return None
+
+        dialog_id = self._call_int(message_or_object, "getDialogId")
+        msg_id = self._call_int(message_or_object, "getId")
+        if dialog_id not in (None, 0) and msg_id not in (None, 0):
+            return (int(dialog_id), int(msg_id))
+
+        message = self._message_owner(message_or_object)
+        if message is None:
+            return None
+
+        msg_id = self._to_int(self._field(message, "id"), 0)
+        if msg_id == 0:
+            msg_id = self._to_int(self._field(message, "message_id"), 0)
+
+        dialog_id = self._to_int(self._field(message, "dialog_id"), 0)
+        if dialog_id == 0:
+            dialog_id = self.dialog_id_from_peer(self._field(message, "peer_id")) or 0
+        if dialog_id == 0:
+            dialog_id = self.dialog_id_from_peer(self._field(message, "to_id")) or 0
+
+        if dialog_id == 0 or msg_id == 0:
+            return None
+        return (int(dialog_id), int(msg_id))
+
+    def dialog_id_from_peer(self, peer: Any) -> Optional[int]:
+        if peer is None:
+            return None
+        channel_id = self._to_int(self._field(peer, "channel_id"), 0)
+        if channel_id:
+            return -channel_id
+        chat_id = self._to_int(self._field(peer, "chat_id"), 0)
+        if chat_id:
+            return -chat_id
+        user_id = self._to_int(self._field(peer, "user_id"), 0)
+        if user_id:
+            return user_id
+        return None
+
+    def message_has_inline_markup(self, message: Any) -> bool:
+        markup = self._field(message, "reply_markup")
+        if markup is None:
+            return False
+        name = self._simple_name(markup)
+        if "replyInlineMarkup" in name or "Inline" in name:
+            return True
+        rows = self._field(markup, "rows")
+        return self._java_list_size(rows) > 0
+
+    # ------------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------------
+
+    def draw_timers(self, cell: Any, canvas: Any) -> None:
+        if not self._setting_bool("enabled", True) or canvas is None:
+            return
+
+        try:
+            bot_buttons = self._bot_buttons(cell)
+            if self._java_list_size(bot_buttons) <= 0:
+                return
+
+            message_object = self.current_message_object(cell)
+            key = self.key_from_message(message_object)
+            if key is None:
+                self._log_once("missing_key", "could not resolve dialog_id/msg_id for ChatMessageCell")
+                return
+
+            self._remember_cell(cell)
+            start_ms = self.ensure_timer(key)
+            elapsed = max(0, self.now_ms() - start_ms)
+            text = self.format_elapsed(elapsed)
+            color = self.timer_color()
+            position_left = self._position_left()
+
+            helper_result = self._helper_call("drawTimers", cell, canvas, text, int(color), bool(position_left))
+            if helper_result is True:
+                return
+
+            paint = self.paint_for_cell(cell)
+
+            width_for_buttons = self.width_for_buttons(cell)
+            add_x = self.buttons_add_x(cell, width_for_buttons)
+            base_y = self._to_float(self._field(cell, "layoutHeight"), 0.0) - self.dp(cell, 2)
+            transition = self._field(cell, "transitionParams")
+            base_y += self._to_float(self._field(transition, "deltaBottom"), 0.0)
+            pad = self.dp(cell, 8)
+
+            for button in self._iter_java_list(bot_buttons):
+                if self._setting_bool_field(button, "isSeparator", False):
+                    continue
+                x = self._to_float(self._field(button, "x"), 0.0) * width_for_buttons + add_x
+                y = self._to_float(self._field(button, "y"), 0.0) + base_y
+                width = self._to_float(self._field(button, "width"), 0.0) * width_for_buttons
+                height = self._to_float(self._field(button, "height"), 0.0)
+                if width <= 0 or height <= 0:
+                    continue
+
+                if position_left:
+                    paint.setTextAlign(Paint.Align.LEFT)
+                    text_x = x + pad
+                else:
+                    paint.setTextAlign(Paint.Align.RIGHT)
+                    text_x = x + width - pad
+                text_y = y + (height - paint.descent() - paint.ascent()) / 2.0
+                canvas.drawText(text, float(text_x), float(text_y), paint)
+        except Exception:
+            self._log_once("draw_failed", f"draw failed: {traceback.format_exc()}")
+
+    def paint_for_cell(self, cell: Any) -> Paint:
+        if self._paint is None:
+            self._paint = Paint(Paint.ANTI_ALIAS_FLAG)
+            self._paint.setTypeface(Typeface.MONOSPACE)
+        self._paint.setTextSize(float(self.dp(cell, 11)))
+        self._paint.setColor(self.timer_color())
+        return self._paint
+
+    def format_elapsed(self, elapsed_ms: int) -> str:
+        seconds = elapsed_ms // 1000
+        millis = elapsed_ms % 1000
+        return f"{seconds}.{millis:03d}"
+
+    def width_for_buttons(self, cell: Any) -> float:
+        width = self._to_float(self._field(cell, "widthForButtons"), 0.0)
+        if width > 0:
+            return width
+        width = self._to_float(self._invoke_no_args(cell, "getWidthForButtons"), 0.0)
+        if width > 0:
+            return width
+        return float(self._call_int(cell, "getMeasuredWidth") or 0)
+
+    def buttons_add_x(self, cell: Any, width_for_buttons: float) -> float:
+        message_object = self.current_message_object(cell)
+        is_out = bool(self._invoke_no_args(message_object, "isOutOwner")) if message_object is not None else False
+        if is_out:
+            measured_width = self._to_float(self._invoke_no_args(cell, "getMeasuredWidth"), 0.0)
+            add_x = measured_width - width_for_buttons - self.dp(cell, 10)
+        else:
+            background_left = self._to_float(self._field(cell, "backgroundDrawableLeft"), 0.0)
+            media_background = self._setting_bool_field(cell, "mediaBackground", False)
+            draw_pinned_bottom = self._setting_bool_field(cell, "drawPinnedBottom", False)
+            add_x = background_left + self.dp(cell, 1 if media_background or draw_pinned_bottom else 7)
+
+        transition = self._field(cell, "transitionParams")
+        if self._setting_bool_field(transition, "animateBackgroundBoundsInner", False):
+            add_x += self._to_float(self._field(transition, "deltaLeft"), 0.0)
+        return add_x
+
+    # ------------------------------------------------------------------
+    # Tick / invalidation
+    # ------------------------------------------------------------------
+
+    def _schedule_tick(self, delay_ms: Optional[int] = None) -> None:
+        if not self._running:
+            return
+        token = self._tick_token
+        delay = self.tick_ms() if delay_ms is None else delay_ms
+        run_on_ui_thread(lambda: self._tick(token), delay)
+
+    def _tick(self, token: int) -> None:
+        if not self._running or token != self._tick_token:
+            return
+        try:
+            if self._setting_bool("enabled", True):
+                self.invalidate_visible_cells()
+        finally:
+            self._schedule_tick()
+
+    def invalidate_visible_cells(self) -> None:
+        kept: List[Any] = []
+        for cell in list(self._visible_cells):
+            try:
+                if self._java_list_size(self._bot_buttons(cell)) <= 0:
+                    continue
+                if self._invoke_no_args(cell, "getWindowToken") is None:
+                    continue
+                if hasattr(cell, "invalidate"):
+                    cell.invalidate()
+                kept.append(cell)
+            except Exception:
+                continue
+        self._visible_cells = kept[-128:]
+
+    def _remember_cell(self, cell: Any) -> None:
+        for existing in self._visible_cells:
+            if existing is cell:
+                return
+        self._visible_cells.append(cell)
+        if len(self._visible_cells) > 128:
+            self._visible_cells = self._visible_cells[-128:]
+
+    # ------------------------------------------------------------------
+    # No-ripple visual cleanup
+    # ------------------------------------------------------------------
+
+    def clear_button_press_visuals(self, cell: Any, event: Any) -> None:
+        if not self._setting_bool("disable_ripple", True) or event is None:
+            return
+        try:
+            action = self._to_int(self._invoke_no_args(event, "getAction"), -1)
+            if action != MotionEvent.ACTION_DOWN:
+                return
+
+            helper_result = self._helper_call("clearPressedBotButton", cell)
+            if helper_result is True:
+                return
+
+            bot_buttons = self._bot_buttons(cell)
+            pressed_index = self._to_int(self._field(cell, "pressedBotButton"), -1)
+            if pressed_index < 0 or pressed_index >= self._java_list_size(bot_buttons):
+                return
+
+            button = self._list_get(bot_buttons, pressed_index)
+            if button is None:
+                return
+
+            changed = False
+            selector = self._field(button, "selectorDrawable")
+            if selector is not None:
+                self._safe_call(lambda s=selector: s.setState(StateSet.NOTHING), "selector.setState")
+                changed = True
+            if self._safe_call(lambda b=button: b.setPressed(False), "button.setPressed"):
+                changed = True
+
+            if changed:
+                self._safe_call(lambda: cell.invalidate(), "cell.invalidate")
+        except Exception:
+            self._log_once("clear_ripple_failed", f"clear ripple failed: {traceback.format_exc()}")
+
+    # ------------------------------------------------------------------
+    # Reflection helpers
+    # ------------------------------------------------------------------
+
+    def _bot_buttons(self, cell: Any) -> Any:
+        buttons = self._field(cell, "botButtons")
+        if buttons is not None:
+            return buttons
+        return self._field(cell, "replyButtons")
+
+    def current_message_object(self, cell: Any) -> Any:
+        message_object = self._field(cell, "currentMessageObject")
+        if message_object is not None:
+            return message_object
+        return self._invoke_no_args(cell, "getMessageObject")
+
+    def _message_owner(self, value: Any) -> Any:
+        if value is None:
+            return None
+        owner = self._field(value, "messageOwner")
+        return owner if owner is not None else value
+
+    def _field(self, obj: Any, field_name: str, default: Any = None) -> Any:
+        if obj is None:
+            return default
+        try:
+            value = getattr(obj, field_name)
+            if value is not None:
+                return value
+        except Exception:
+            pass
+        try:
+            value = get_private_field(obj, field_name)
+            return default if value is None else value
+        except Exception:
+            return default
+
+    def _invoke_no_args(self, obj: Any, method_name: str) -> Any:
+        if obj is None:
+            return None
+        try:
+            method = getattr(obj, method_name)
+            return method()
+        except Exception:
+            pass
+        try:
+            method = obj.getClass().getDeclaredMethod(method_name)
+            method.setAccessible(True)
+            return method.invoke(obj)
+        except Exception:
+            return None
+
+    def _call_int(self, obj: Any, method_name: str) -> Optional[int]:
+        value = self._invoke_no_args(obj, method_name)
+        return None if value is None else self._to_int(value, 0)
+
+    def _simple_name(self, obj: Any) -> str:
+        if obj is None:
+            return ""
+        try:
+            return str(obj.getClass().getSimpleName())
+        except Exception:
+            return obj.__class__.__name__
+
+    def _class_name(self, clazz: Any) -> str:
+        try:
+            return str(clazz.getName())
+        except Exception:
+            return str(clazz)
+
+    def _is_java_list(self, value: Any) -> bool:
+        return isinstance(value, (list, tuple)) or self._java_list_size(value) >= 0
+
+    def _java_list_size(self, value: Any) -> int:
+        if value is None:
+            return -1
+        if isinstance(value, (list, tuple)):
+            return len(value)
+        try:
+            return len(value)
+        except Exception:
+            pass
+        try:
+            return int(value.size())
+        except Exception:
+            return -1
+
+    def _iter_java_list(self, value: Any) -> Iterable[Any]:
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                yield item
+            return
+        try:
+            for index in range(len(value)):
+                yield value[index]
+            return
+        except Exception:
+            pass
+        size = self._java_list_size(value)
+        if size >= 0:
+            for index in range(size):
+                try:
+                    item = self._list_get(value, index)
+                    if item is not None:
+                        yield item
+                except Exception:
+                    continue
+            return
+        try:
+            for item in value:
+                yield item
+        except Exception:
+            return
+
+    def _list_get(self, value: Any, index: int) -> Any:
+        if value is None:
+            return None
+        try:
+            return value[index]
+        except Exception:
+            pass
+        try:
+            return value.get(index)
+        except Exception:
+            return None
+
+    def _to_int(self, value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+    def _to_float(self, value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return default
+
+    def _setting_bool_field(self, obj: Any, field_name: str, default: bool) -> bool:
+        value = self._field(obj, field_name, default)
+        if isinstance(value, str):
+            return value.lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def dp(self, view: Any, value: float) -> int:
+        try:
+            density = float(view.getResources().getDisplayMetrics().density)
+            return int(value * density + 0.5)
+        except Exception:
+            return int(value)
+
+    # ------------------------------------------------------------------
+    # Setting helpers / logging
+    # ------------------------------------------------------------------
+
+    def _setting_bool(self, key: str, default: bool) -> bool:
+        value = self.get_setting(key, default)
+        if isinstance(value, str):
+            return value.lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def tick_ms(self) -> int:
+        value = self._to_int(self.get_setting("tick_ms", "100"), 100)
+        return max(50, min(value, 1000))
+
+    def timer_color(self) -> int:
+        value = str(self.get_setting("timer_color", "#B0FFFFFF") or "#B0FFFFFF")
+        try:
+            return int(Color.parseColor(value))
+        except Exception:
+            return int(Color.parseColor("#B0FFFFFF"))
+
+    def _position_left(self) -> bool:
+        return self._to_int(self.get_setting("position", 1), 1) == 0
+
+    def _safe_call(self, func: Any, label: str) -> bool:
+        try:
+            func()
+            return True
+        except Exception:
+            self._log_once(label, f"{label} failed: {traceback.format_exc()}")
+            return False
+
+    def _log(self, message: str) -> None:
+        try:
+            self.log(f"[{__id__}] {message}")
+        except Exception:
+            log(f"[{__id__}] {message}")
+
+    def _debug(self, message: str) -> None:
+        if self._setting_bool("debug_logs", False):
+            self._log(message)
+
+    def _log_once(self, key: str, message: str) -> None:
+        if key in self._last_logged_missing_fields:
+            return
+        self._last_logged_missing_fields.add(key)
+        self._log(message)
