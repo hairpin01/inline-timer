@@ -33,7 +33,7 @@ public final class InlineTimerHelper {
     private InlineTimerHelper() {
     }
 
-    public static boolean drawTimers(Object cell, Canvas canvas, String text, int color, boolean left) {
+    public static boolean drawTimers(Object cell, Canvas canvas, String text, long color, boolean left) {
         if (cell == null || canvas == null || text == null) {
             return false;
         }
@@ -60,7 +60,7 @@ public final class InlineTimerHelper {
             baseY += floatValue(field(transition, "deltaBottom"));
             int pad = dp(cell, 8.0f);
 
-            PAINT.setColor(color);
+            PAINT.setColor((int) color);
             PAINT.setTextSize(dp(cell, 11.0f));
             PAINT.setTextAlign(left ? Paint.Align.LEFT : Paint.Align.RIGHT);
 

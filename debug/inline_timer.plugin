@@ -39,7 +39,7 @@ NEW_MESSAGE_UPDATES = {"TL_updateNewMessage", "TL_updateNewChannelMessage"}
 REGISTERED_HOOKS = tuple(sorted(EDIT_UPDATES | NEW_MESSAGE_UPDATES | {CALLBACK_REQUEST}))
 HELPER_CLASS_NAME = "org.exteragram.plugins.inlinetimer.InlineTimerHelper"
 HELPER_DEX_URL = "https://raw.githubusercontent.com/hairpin01/inline-timer/main/debug/inline_timer_helper/inline_timer_helper.dex"
-HELPER_DEX_SHA256 = "f4d451e86b235e0cfebb412c7a6dff573f27e1938fbc6b527bfce386d906f825"
+HELPER_DEX_SHA256 = "542c40e3b2b8ce3d24d809bfd82c0767fe01874619257bf5b2a235936b0be574"
 HELPER_DEX_FILE = "inline_timer_helper.dex"
 
 
@@ -756,7 +756,7 @@ class InlineTimerPlugin(BasePlugin):
             color = self.timer_color()
             position_left = self._position_left()
 
-            helper_result = self._helper_call("drawTimers", cell, canvas, text, self._java_int(color), self._java_bool(position_left))
+            helper_result = self._helper_call("drawTimers", cell, canvas, text, self._java_long(color), self._java_bool(position_left))
             if self._is_java_true(helper_result):
                 return
 
@@ -795,7 +795,7 @@ class InlineTimerPlugin(BasePlugin):
             self._paint = Paint(Paint.ANTI_ALIAS_FLAG)
             self._paint.setTypeface(Typeface.MONOSPACE)
         self._paint.setTextSize(float(self.dp(cell, 11)))
-        self._paint.setColor(self.timer_color())
+        self._paint.setColor(self._java_int(self.timer_color()))
         return self._paint
 
     def format_elapsed(self, elapsed_ms: int) -> str:
@@ -1057,6 +1057,14 @@ class InlineTimerPlugin(BasePlugin):
             from java.lang import Integer
 
             return Integer.valueOf(self._signed_int32(value))
+        except Exception:
+            return self._signed_int32(value)
+
+    def _java_long(self, value: int) -> Any:
+        try:
+            from java.lang import Long
+
+            return Long.valueOf(self._signed_int32(value))
         except Exception:
             return self._signed_int32(value)
 
