@@ -756,8 +756,8 @@ class InlineTimerPlugin(BasePlugin):
             color = self.timer_color()
             position_left = self._position_left()
 
-            helper_result = self._helper_call("drawTimers", cell, canvas, text, int(color), bool(position_left))
-            if helper_result is True:
+            helper_result = self._helper_call("drawTimers", cell, canvas, text, self._java_int(color), self._java_bool(position_left))
+            if self._is_java_true(helper_result):
                 return
 
             paint = self.paint_for_cell(cell)
@@ -885,7 +885,7 @@ class InlineTimerPlugin(BasePlugin):
                 return
 
             helper_result = self._helper_call("clearPressedBotButton", cell)
-            if helper_result is True:
+            if self._is_java_true(helper_result):
                 return
 
             bot_buttons = self._bot_buttons(cell)
@@ -1048,6 +1048,34 @@ class InlineTimerPlugin(BasePlugin):
         except Exception:
             return default
 
+    def _signed_int32(self, value: int) -> int:
+        value = int(value) & 0xFFFFFFFF
+        return value - 0x100000000 if value > 0x7FFFFFFF else value
+
+    def _java_int(self, value: int) -> Any:
+        try:
+            from java.lang import Integer
+
+            return Integer.valueOf(self._signed_int32(value))
+        except Exception:
+            return self._signed_int32(value)
+
+    def _java_bool(self, value: bool) -> Any:
+        try:
+            from java.lang import Boolean
+
+            return Boolean.valueOf(bool(value))
+        except Exception:
+            return bool(value)
+
+    def _is_java_true(self, value: Any) -> bool:
+        if value is True:
+            return True
+        try:
+            return bool(value.booleanValue())
+        except Exception:
+            return str(value).lower() == "true"
+
     def _setting_bool_field(self, obj: Any, field_name: str, default: bool) -> bool:
         value = self._field(obj, field_name, default)
         if isinstance(value, str):
@@ -1078,9 +1106,9 @@ class InlineTimerPlugin(BasePlugin):
     def timer_color(self) -> int:
         value = str(self.get_setting("timer_color", "#B0FFFFFF") or "#B0FFFFFF")
         try:
-            return int(Color.parseColor(value))
+            return self._signed_int32(int(Color.parseColor(value)))
         except Exception:
-            return int(Color.parseColor("#B0FFFFFF"))
+            return self._signed_int32(int(Color.parseColor("#B0FFFFFF")))
 
     def _position_left(self) -> bool:
         return self._to_int(self.get_setting("position", 1), 1) == 0
