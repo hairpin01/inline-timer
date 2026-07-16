@@ -103,6 +103,7 @@ class InlineTimerPlugin(BasePlugin):
         self._helper_last_error = ""
         self._helper_last_path = ""
         self._context_fallback: Optional[Any] = None
+        self._last_draw_ms: Dict[int, int] = {}
         self._log_lines = deque(maxlen=200)
         self._last_logged_missing_fields: set[str] = set()
 
@@ -253,7 +254,8 @@ class InlineTimerPlugin(BasePlugin):
     def _install_xposed_hooks(self) -> None:
         chat_cell_cls = find_class("org.telegram.ui.Cells.ChatMessageCell")
         if chat_cell_cls is not None:
-            self._hook_all(chat_cell_cls, "draw", _DrawHook(self))
+            self._hook_all(chat_cell_cls, "onDraw", _DrawHook(self))
+            self._hook_all(chat_cell_cls, "drawInternal", _DrawHook(self))
             self._hook_all(chat_cell_cls, "onTouchEvent", _TouchHook(self))
         else:
             self._log("ChatMessageCell class not found")
@@ -720,6 +722,16 @@ class InlineTimerPlugin(BasePlugin):
             return
 
         try:
+            now = self.now_ms()
+            cell_hash = self._to_int(self._invoke_no_args(cell, "hashCode"), id(cell))
+            last_draw = self._last_draw_ms.get(cell_hash, 0)
+            if now - last_draw < 15:
+                return
+            self._last_draw_ms[cell_hash] = now
+            if len(self._last_draw_ms) > 512:
+                for old_key in list(self._last_draw_ms.keys())[:128]:
+                    self._last_draw_ms.pop(old_key, None)
+
             bot_buttons = self._bot_buttons(cell)
             if self._java_list_size(bot_buttons) <= 0:
                 return
@@ -732,7 +744,7 @@ class InlineTimerPlugin(BasePlugin):
 
             self._remember_cell(cell)
             start_ms = self.ensure_timer(key)
-            elapsed = max(0, self.now_ms() - start_ms)
+            elapsed = max(0, now - start_ms)
             text = self.format_elapsed(elapsed)
             color = self.timer_color()
             position_left = self._position_left()
