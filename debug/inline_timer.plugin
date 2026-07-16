@@ -192,6 +192,13 @@ class InlineTimerPlugin(BasePlugin):
                 on_click=lambda view: self.show_logs_in_settings(),
             ),
             Text(
+                text="Copy logs",
+                subtext="Copy full Inline Timer logs to clipboard.",
+                icon="msg_copy",
+                accent=True,
+                on_click=lambda view: self.copy_logs_to_clipboard(),
+            ),
+            Text(
                 text="Send logs file to chat",
                 subtext="Sends inline_timer_logs.txt to Log chat id.",
                 icon="msg2_discuss",
@@ -1079,7 +1086,16 @@ class InlineTimerPlugin(BasePlugin):
         return self._to_int(self.get_setting("position", 1), 1) == 0
 
     def show_logs_in_settings(self) -> None:
-        self._show_dialog("Inline Timer logs", self.build_logs_text())
+        self._show_dialog("Inline Timer logs", self.build_logs_text(compact=True))
+
+    def copy_logs_to_clipboard(self) -> None:
+        try:
+            from android_utils import copy_to_clipboard
+
+            copy_to_clipboard(self.build_logs_text(compact=False))
+            self._log("copied logs to clipboard")
+        except Exception:
+            self._log_once("copy_logs_failed", f"copy logs failed: {traceback.format_exc()}")
 
     def send_logs_to_configured_chat(self) -> None:
         peer_raw = str(self.get_setting("log_peer_id", "") or "").strip()
@@ -1121,7 +1137,7 @@ class InlineTimerPlugin(BasePlugin):
             file.write("\n")
         return path
 
-    def build_logs_text(self) -> str:
+    def build_logs_text(self, compact: bool = False) -> str:
         helper_status = "loaded" if self._helper_class is not None else ("failed" if self._helper_failed else "not loaded")
         lines = [
             "Inline Timer logs",
@@ -1136,19 +1152,44 @@ class InlineTimerPlugin(BasePlugin):
             "Recent log entries:",
         ]
         if self._helper_last_error:
-            lines.extend(["", "Helper error:", self._helper_last_error[:1200]])
+            if compact:
+                lines.extend(["", "Helper error:", self._compact_multiline(self._helper_last_error, 600)])
+            else:
+                lines.extend(["", "Helper error:", self._helper_last_error])
             lines.append("")
+
         entries = list(getattr(self, "_log_lines", []))
+        if compact:
+            entries = [self._compact_multiline(entry, 260) for entry in entries[-50:]]
         if entries:
             lines.extend(entries)
         else:
             lines.append("<empty>")
 
         text = "\n".join(lines)
+        if not compact:
+            return text
         max_len = 3900
         if len(text) <= max_len:
             return text
-        return "Inline Timer logs\n<truncated>\n" + text[-max_len:]
+        return text[:max_len] + "\n<truncated: use Copy logs or Send logs file for full output>"
+
+    def _compact_multiline(self, text: str, max_len: int) -> str:
+        lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+        if not lines:
+            return ""
+        if len(lines) == 1:
+            value = lines[0]
+        else:
+            useful_tail = ""
+            for line in reversed(lines):
+                if not line.startswith("at ") and not line.startswith("File "):
+                    useful_tail = line
+                    break
+            value = lines[0] if not useful_tail or useful_tail == lines[0] else f"{lines[0]} … {useful_tail}"
+        if len(value) <= max_len:
+            return value
+        return value[: max_len - 1] + "…"
 
     def _safe_call(self, func: Any, label: str) -> bool:
         try:
