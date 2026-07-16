@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 import traceback
 import urllib.request
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -35,6 +36,9 @@ EDIT_UPDATES = {"TL_updateEditMessage", "TL_updateEditChannelMessage"}
 NEW_MESSAGE_UPDATES = {"TL_updateNewMessage", "TL_updateNewChannelMessage"}
 REGISTERED_HOOKS = tuple(sorted(EDIT_UPDATES | NEW_MESSAGE_UPDATES | {CALLBACK_REQUEST}))
 HELPER_CLASS_NAME = "org.exteragram.plugins.inlinetimer.InlineTimerHelper"
+HELPER_DEX_URL = "https://raw.githubusercontent.com/hairpin01/inline-timer/main/debug/inline_timer_helper/inline_timer_helper.dex"
+HELPER_DEX_SHA256 = "f4d451e86b235e0cfebb412c7a6dff573f27e1938fbc6b527bfce386d906f825"
+HELPER_DEX_FILE = "inline_timer_helper.dex"
 
 
 def _param_args(param: Any) -> Iterable[Any]:
@@ -92,6 +96,7 @@ class InlineTimerPlugin(BasePlugin):
         self._paint: Optional[Paint] = None
         self._helper_class: Optional[Any] = None
         self._helper_failed = False
+        self._helper_download_running = False
         self._last_logged_missing_fields: set[str] = set()
 
     # ------------------------------------------------------------------
@@ -105,7 +110,7 @@ class InlineTimerPlugin(BasePlugin):
         for hook_name in REGISTERED_HOOKS:
             self._safe_call(lambda name=hook_name: self.add_hook(name), f"add_hook({hook_name})")
 
-        self._load_helper_dex()
+        self._ensure_helper_dex_async(force_download=False)
         self._install_xposed_hooks()
         self._schedule_tick(0)
         self._log("loaded")
@@ -157,26 +162,12 @@ class InlineTimerPlugin(BasePlugin):
                 subtext="Android color string, for example #B0FFFFFF or #AA000000.",
                 icon="msg_palette",
             ),
-            Input(
-                key="helper_dex_path",
-                text="Helper dex path",
-                default="",
-                subtext="Optional local path to inline_timer_helper.dex. If empty, Python reflection fallback is used.",
-                icon="msg_file",
-            ),
-            Input(
-                key="helper_dex_url",
-                text="Helper dex URL",
-                default="",
-                subtext="Optional direct URL, for example raw.githubusercontent.com/.../inline_timer_helper.dex.",
-                icon="msg_link",
-            ),
-            Input(
-                key="helper_dex_sha256",
-                text="Helper dex SHA-256",
-                default="",
-                subtext="Recommended for URL loading. Leave empty only while testing your own dex.",
-                icon="msg_permissions",
+            Text(
+                text="Download helper dex",
+                subtext="The plugin downloads it automatically on load. Tap here to retry manually if it did not start.",
+                icon="msg_download",
+                accent=True,
+                on_click=lambda view: self.download_helper_dex_manually(),
             ),
             Switch(
                 key="debug_logs",
@@ -251,13 +242,27 @@ class InlineTimerPlugin(BasePlugin):
     # Optional Java/Dex helper
     # ------------------------------------------------------------------
 
-    def _load_helper_dex(self) -> None:
+    def download_helper_dex_manually(self) -> None:
+        self._ensure_helper_dex_async(force_download=True)
+
+    def _ensure_helper_dex_async(self, force_download: bool) -> None:
+        if self._helper_download_running:
+            self._debug("helper dex download already running")
+            return
+
+        self._helper_download_running = True
+
+        def worker() -> None:
+            try:
+                self._load_helper_dex(force_download=force_download)
+            finally:
+                self._helper_download_running = False
+
+        threading.Thread(target=worker, name="InlineTimerHelperDex", daemon=True).start()
+
+    def _load_helper_dex(self, force_download: bool = False) -> None:
         self._helper_class = None
         self._helper_failed = False
-
-        dex_path = str(self.get_setting("helper_dex_path", "") or "").strip()
-        dex_url = str(self.get_setting("helper_dex_url", "") or "").strip()
-        expected_hash = str(self.get_setting("helper_dex_sha256", "") or "").strip().lower()
 
         try:
             context = self._application_context()
@@ -265,16 +270,16 @@ class InlineTimerPlugin(BasePlugin):
                 return
             work_dir = context.getDir("inline_timer_helper", 0)
             optimized_dir = context.getDir("inline_timer_helper_odex", 0)
+            dex_path = os.path.join(str(work_dir.getAbsolutePath()), HELPER_DEX_FILE)
 
-            if not dex_path and dex_url:
-                dex_path = os.path.join(str(work_dir.getAbsolutePath()), "inline_timer_helper.dex")
-                self._download_helper_dex(dex_url, dex_path)
+            if force_download or not os.path.exists(dex_path) or not self._helper_dex_hash_ok(dex_path):
+                self._download_helper_dex(HELPER_DEX_URL, dex_path)
 
-            if not dex_path or not os.path.exists(dex_path):
+            if not os.path.exists(dex_path):
                 return
 
             actual_hash = self._sha256_file(dex_path)
-            if expected_hash and actual_hash != expected_hash:
+            if actual_hash != HELPER_DEX_SHA256:
                 self._helper_failed = True
                 self._log(f"helper dex hash mismatch: {actual_hash}")
                 return
@@ -292,13 +297,26 @@ class InlineTimerPlugin(BasePlugin):
             self._helper_failed = True
             self._log_once("helper_load_failed", f"helper dex load failed: {traceback.format_exc()}")
 
+    def _helper_dex_hash_ok(self, path: str) -> bool:
+        try:
+            return os.path.exists(path) and self._sha256_file(path) == HELPER_DEX_SHA256
+        except Exception:
+            return False
+
     def _download_helper_dex(self, url: str, target_path: str) -> None:
         tmp_path = f"{target_path}.tmp"
-        with urllib.request.urlopen(url, timeout=15) as response:
-            data = response.read(1024 * 1024 * 2)
-        with open(tmp_path, "wb") as file:
-            file.write(data)
-        os.replace(tmp_path, target_path)
+        try:
+            with urllib.request.urlopen(url, timeout=15) as response:
+                data = response.read(1024 * 1024 * 2)
+            with open(tmp_path, "wb") as file:
+                file.write(data)
+            os.replace(tmp_path, target_path)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
     def _sha256_file(self, path: str) -> str:
         digest = hashlib.sha256()

@@ -41,10 +41,13 @@ cp build/dex/classes.dex inline_timer_helper.dex
 sha256sum inline_timer_helper.dex
 ```
 
-Publish `inline_timer_helper.dex` somewhere direct-downloadable, for example a
-GitHub Release asset or a raw file, then put the URL into plugin setting
-`Helper dex URL`. Put the printed hash into `Helper dex SHA-256`.
+The plugin automatically downloads this file from:
 
-For local testing, push/copy `inline_timer_helper.dex` to app-accessible storage
-and set `Helper dex path` instead. If loading fails, the plugin falls back to
-Python reflection.
+```text
+https://raw.githubusercontent.com/hairpin01/inline-timer/main/debug/inline_timer_helper/inline_timer_helper.dex
+```
+
+The SHA-256 is hardcoded in the plugin, so a corrupted or replaced dex will not
+be loaded. If automatic loading fails, open plugin settings and tap
+`Download helper dex` to retry manually. If loading still fails, the plugin falls
+back to Python reflection.
