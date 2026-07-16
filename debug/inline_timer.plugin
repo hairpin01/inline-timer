@@ -13,7 +13,6 @@ from android.graphics import Color, Paint, Typeface
 from android.os import SystemClock
 from android.util import StateSet
 from android.view import MotionEvent
-from dalvik.system import DexClassLoader
 from android_utils import log, run_on_ui_thread
 from base_plugin import BasePlugin, HookResult, MethodHook
 from hook_utils import find_class, get_private_field
@@ -28,6 +27,7 @@ __version__ = "0.1.0"
 __icon__ = "exteraPlugins/1"
 __app_version__ = ">=12.5.1"
 __sdk_version__ = ">=1.4.3.3"
+__min_version__ = "12.5.1"
 
 
 TimerKey = Tuple[int, int]
@@ -41,7 +41,6 @@ HELPER_CLASS_NAME = "org.exteragram.plugins.inlinetimer.InlineTimerHelper"
 HELPER_DEX_URL = "https://raw.githubusercontent.com/hairpin01/inline-timer/main/debug/inline_timer_helper/inline_timer_helper.dex"
 HELPER_DEX_SHA256 = "f4d451e86b235e0cfebb412c7a6dff573f27e1938fbc6b527bfce386d906f825"
 HELPER_DEX_FILE = "inline_timer_helper.dex"
-LOG_COMMANDS = (".inline_timer_logs", ".itlogs")
 
 
 def _param_args(param: Any) -> Iterable[Any]:
@@ -100,6 +99,9 @@ class InlineTimerPlugin(BasePlugin):
         self._helper_class: Optional[Any] = None
         self._helper_failed = False
         self._helper_download_running = False
+        self._helper_last_status = "not loaded"
+        self._helper_last_error = ""
+        self._helper_last_path = ""
         self._log_lines = deque(maxlen=200)
         self._last_logged_missing_fields: set[str] = set()
 
@@ -113,7 +115,6 @@ class InlineTimerPlugin(BasePlugin):
 
         for hook_name in REGISTERED_HOOKS:
             self._safe_call(lambda name=hook_name: self.add_hook(name), f"add_hook({hook_name})")
-        self._safe_call(lambda: self.add_on_send_message_hook(), "add_on_send_message_hook")
 
         self._ensure_helper_dex_async(force_download=False)
         self._install_xposed_hooks()
@@ -178,12 +179,12 @@ class InlineTimerPlugin(BasePlugin):
                 key="log_peer_id",
                 text="Log chat id",
                 default="",
-                subtext="Optional. Fill this to use the button below, or type .inline_timer_logs in any chat.",
+                subtext="Optional. Fill this to use the button below.",
                 icon="msg_log",
             ),
             Text(
                 text="Send logs file to chat",
-                subtext="Sends inline_timer_logs.txt to Log chat id. In any chat you can also send .itlogs.",
+                subtext="Sends inline_timer_logs.txt to Log chat id.",
                 icon="msg2_discuss",
                 accent=True,
                 on_click=lambda view: self.send_logs_to_configured_chat(),
@@ -237,33 +238,6 @@ class InlineTimerPlugin(BasePlugin):
                 self.reset_timer(key, "callback:answer")
         return HookResult()
 
-    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
-        message = getattr(params, "message", None)
-        if not isinstance(message, str):
-            return HookResult()
-
-        command = message.strip().split(" ", 1)[0].lower()
-        if command not in LOG_COMMANDS:
-            return HookResult()
-
-        try:
-            from base_plugin import HookStrategy
-
-            peer_id = self._peer_from_send_params(params)
-            if peer_id != 0:
-                self._send_logs_file_async(peer_id)
-                cancel_strategy = getattr(HookStrategy, "CANCEL", None)
-                if cancel_strategy is not None:
-                    return HookResult(strategy=cancel_strategy, params=params)
-                params.message = "Inline Timer logs file is being sent..."
-                return HookResult(strategy=HookStrategy.MODIFY, params=params)
-
-            params.message = "Set Log chat id in Inline Timer settings, or use the settings button to send logs as a file."
-            return HookResult(strategy=HookStrategy.MODIFY, params=params)
-        except Exception:
-            self._log_once("send_log_command_failed", f"log command failed: {traceback.format_exc()}")
-            return HookResult()
-
     # ------------------------------------------------------------------
     # Xposed registration
     # ------------------------------------------------------------------
@@ -289,48 +263,74 @@ class InlineTimerPlugin(BasePlugin):
     # ------------------------------------------------------------------
 
     def download_helper_dex_manually(self) -> None:
-        self._ensure_helper_dex_async(force_download=True)
+        self._show_bulletin("Downloading helper dex...")
+        self._ensure_helper_dex_async(force_download=True, notify=True)
 
-    def _ensure_helper_dex_async(self, force_download: bool) -> None:
+    def _ensure_helper_dex_async(self, force_download: bool, notify: bool = False) -> None:
         if self._helper_download_running:
-            self._debug("helper dex download already running")
+            message = "Helper dex download is already running"
+            self._log(message)
+            if notify:
+                self._show_bulletin(message)
             return
 
         self._helper_download_running = True
 
         def worker() -> None:
             try:
-                self._load_helper_dex(force_download=force_download)
+                status = self._load_helper_dex(force_download=force_download)
+                if notify:
+                    self._show_helper_result(status)
             finally:
                 self._helper_download_running = False
 
         threading.Thread(target=worker, name="InlineTimerHelperDex", daemon=True).start()
 
-    def _load_helper_dex(self, force_download: bool = False) -> None:
+    def _load_helper_dex(self, force_download: bool = False) -> str:
         self._helper_class = None
         self._helper_failed = False
+        self._helper_last_error = ""
 
         try:
             context = self._application_context()
             if context is None:
-                return
+                self._helper_failed = True
+                self._helper_last_status = "failed: no application context"
+                return self._helper_last_status
+
             work_dir = context.getDir("inline_timer_helper", 0)
             optimized_dir = context.getDir("inline_timer_helper_odex", 0)
             dex_path = os.path.join(str(work_dir.getAbsolutePath()), HELPER_DEX_FILE)
+            self._helper_last_path = dex_path
 
             if force_download or not os.path.exists(dex_path) or not self._helper_dex_hash_ok(dex_path):
-                self._download_helper_dex(HELPER_DEX_URL, dex_path)
+                self._log(f"downloading helper dex to {dex_path}")
+                bytes_count = self._download_helper_dex(HELPER_DEX_URL, dex_path)
+                self._log(f"downloaded helper dex: {bytes_count} bytes")
 
             if not os.path.exists(dex_path):
-                return
+                self._helper_failed = True
+                self._helper_last_status = "failed: dex file does not exist after download"
+                return self._helper_last_status
 
             actual_hash = self._sha256_file(dex_path)
             if actual_hash != HELPER_DEX_SHA256:
                 self._helper_failed = True
+                self._helper_last_status = "failed: hash mismatch"
+                self._helper_last_error = f"expected {HELPER_DEX_SHA256}\nactual   {actual_hash}"
                 self._log(f"helper dex hash mismatch: {actual_hash}")
-                return
+                return self._helper_last_status
 
             parent_loader = context.getClassLoader()
+            try:
+                from dalvik.system import DexClassLoader
+            except Exception:
+                self._helper_failed = True
+                self._helper_last_status = "failed: DexClassLoader import failed"
+                self._helper_last_error = traceback.format_exc()
+                self._log_once("dex_class_loader_missing", "DexClassLoader import failed; using Python reflection fallback")
+                return self._helper_last_status
+
             loader = DexClassLoader(
                 dex_path,
                 str(optimized_dir.getAbsolutePath()),
@@ -338,10 +338,15 @@ class InlineTimerPlugin(BasePlugin):
                 parent_loader,
             )
             self._helper_class = loader.loadClass(HELPER_CLASS_NAME)
+            self._helper_last_status = "loaded"
             self._log(f"helper dex loaded: {HELPER_CLASS_NAME}")
+            return self._helper_last_status
         except Exception:
             self._helper_failed = True
-            self._log_once("helper_load_failed", f"helper dex load failed: {traceback.format_exc()}")
+            self._helper_last_status = "failed: exception"
+            self._helper_last_error = traceback.format_exc()
+            self._log_once("helper_load_failed", f"helper dex load failed: {self._helper_last_error}")
+            return self._helper_last_status
 
     def _helper_dex_hash_ok(self, path: str) -> bool:
         try:
@@ -349,7 +354,7 @@ class InlineTimerPlugin(BasePlugin):
         except Exception:
             return False
 
-    def _download_helper_dex(self, url: str, target_path: str) -> None:
+    def _download_helper_dex(self, url: str, target_path: str) -> int:
         tmp_path = f"{target_path}.tmp"
         try:
             with urllib.request.urlopen(url, timeout=15) as response:
@@ -357,12 +362,69 @@ class InlineTimerPlugin(BasePlugin):
             with open(tmp_path, "wb") as file:
                 file.write(data)
             os.replace(tmp_path, target_path)
+            return len(data)
         finally:
             if os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
                 except Exception:
                     pass
+
+    def _show_helper_result(self, status: str) -> None:
+        details = [
+            f"status: {status}",
+            f"path: {self._helper_last_path or '<unknown>'}",
+            f"expected sha256: {HELPER_DEX_SHA256}",
+        ]
+        if self._helper_last_path and os.path.exists(self._helper_last_path):
+            try:
+                details.append(f"actual sha256: {self._sha256_file(self._helper_last_path)}")
+                details.append(f"size: {os.path.getsize(self._helper_last_path)} bytes")
+            except Exception:
+                details.append("actual sha256: <failed to calculate>")
+        if self._helper_last_error:
+            details.extend(["", "error:", self._helper_last_error])
+
+        message = "\n".join(details)
+        self._log(f"helper manual result: {status}")
+        if self._helper_class is not None:
+            self._show_dialog("Inline Timer helper loaded", message)
+        else:
+            self._show_dialog("Inline Timer helper failed", message)
+
+    def _show_bulletin(self, message: str) -> None:
+        def show() -> None:
+            try:
+                from client_utils import get_last_fragment
+                from ui.bulletin import BulletinHelper
+
+                BulletinHelper.show_info(message, get_last_fragment())
+            except Exception:
+                self._log_once("show_bulletin_failed", f"show bulletin failed: {traceback.format_exc()}")
+
+        run_on_ui_thread(show)
+
+    def _show_dialog(self, title: str, message: str) -> None:
+        def show() -> None:
+            try:
+                from client_utils import get_last_fragment
+                from ui.alert import AlertDialogBuilder
+
+                fragment = get_last_fragment()
+                activity = fragment.getParentActivity() if fragment is not None else None
+                if activity is None:
+                    self._log(f"{title}: {message}")
+                    return
+
+                builder = AlertDialogBuilder(activity)
+                builder.set_title(title)
+                builder.set_message(message[:3500])
+                builder.set_positive_button("OK", lambda b, w: b.dismiss())
+                builder.show()
+            except Exception:
+                self._log_once("show_dialog_failed", f"show dialog failed: {traceback.format_exc()}")
+
+        run_on_ui_thread(show)
 
     def _sha256_file(self, path: str) -> str:
         digest = hashlib.sha256()
@@ -949,7 +1011,7 @@ class InlineTimerPlugin(BasePlugin):
     def send_logs_to_configured_chat(self) -> None:
         peer_raw = str(self.get_setting("log_peer_id", "") or "").strip()
         if not peer_raw:
-            self._log("Log chat id is empty; type .inline_timer_logs in the target chat or set log_peer_id")
+            self._log("Log chat id is empty; set log_peer_id in settings before sending logs")
             return
 
         peer_id = self._to_int(peer_raw, 0)
@@ -986,21 +1048,6 @@ class InlineTimerPlugin(BasePlugin):
             file.write("\n")
         return path
 
-    def _peer_from_send_params(self, params: Any) -> int:
-        for field_name in ("peer", "peer_id", "dialog_id", "dialogId"):
-            value = getattr(params, field_name, None)
-            peer_id = self._to_int(value, 0)
-            if peer_id != 0:
-                return peer_id
-
-        nested_params = getattr(params, "params", None)
-        if isinstance(nested_params, dict):
-            for field_name in ("peer", "peer_id", "dialog_id", "dialogId"):
-                peer_id = self._to_int(nested_params.get(field_name), 0)
-                if peer_id != 0:
-                    return peer_id
-        return 0
-
     def build_logs_text(self) -> str:
         helper_status = "loaded" if self._helper_class is not None else ("failed" if self._helper_failed else "not loaded")
         lines = [
@@ -1008,15 +1055,16 @@ class InlineTimerPlugin(BasePlugin):
             f"version: {__version__}",
             f"app/sdk: {__app_version__} / {__sdk_version__}",
             f"helper: {helper_status}",
+            f"helper status: {self._helper_last_status}",
+            f"helper path: {self._helper_last_path or '<unknown>'}",
             f"timers: {len(self.timer_map)}",
             f"visible cells: {len(self._visible_cells)}",
             "",
-            "Commands:",
-            "  .inline_timer_logs",
-            "  .itlogs",
-            "",
             "Recent log entries:",
         ]
+        if self._helper_last_error:
+            lines.extend(["", "Helper error:", self._helper_last_error[:1200]])
+            lines.append("")
         entries = list(getattr(self, "_log_lines", []))
         if entries:
             lines.extend(entries)
