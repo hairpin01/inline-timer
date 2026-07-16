@@ -18,7 +18,7 @@ the plugin; Android already provides these classes at runtime.
 ```bash
 cd inline_timer_helper
 
-ANDROID_HOME=/home/alina/Android/Sdk
+ANDROID_HOME=YOUR_ANDROID_HOME
 ANDROID_JAR="$ANDROID_HOME/platforms/android-35/android.jar"
 D8="$ANDROID_HOME/build-tools/34.0.0/d8"
 
