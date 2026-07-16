@@ -334,6 +334,8 @@ class InlineTimerPlugin(BasePlugin):
                 self._log(f"helper dex hash mismatch: {actual_hash}")
                 return self._helper_last_status
 
+            self._make_helper_dex_read_only(dex_path)
+
             parent_loader = context.getClassLoader()
             try:
                 from dalvik.system import DexClassLoader
@@ -367,6 +369,16 @@ class InlineTimerPlugin(BasePlugin):
         except Exception:
             return False
 
+    def _make_helper_dex_read_only(self, path: str) -> None:
+        try:
+            os.chmod(path, 0o444)
+            self._log("helper dex marked read-only")
+        except Exception:
+            self._helper_failed = True
+            self._helper_last_status = "failed: chmod dex read-only"
+            self._helper_last_error = traceback.format_exc()
+            raise
+
     def _download_helper_dex(self, url: str, target_path: str) -> int:
         tmp_path = f"{target_path}.tmp"
         try:
@@ -393,6 +405,7 @@ class InlineTimerPlugin(BasePlugin):
             try:
                 details.append(f"actual sha256: {self._sha256_file(self._helper_last_path)}")
                 details.append(f"size: {os.path.getsize(self._helper_last_path)} bytes")
+                details.append(f"writable: {os.access(self._helper_last_path, os.W_OK)}")
             except Exception:
                 details.append("actual sha256: <failed to calculate>")
         if self._helper_last_error:
